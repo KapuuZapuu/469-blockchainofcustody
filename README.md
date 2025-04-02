@@ -1,2 +1,2 @@
-# 468Project
-This is the repository for the CSE 468 group 14
+# 469 Project - CoC
+This is the repository for the CSE 469 group 14
