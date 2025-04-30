@@ -1,9 +1,8 @@
-'''
-Group 14
-Ryan Leigh - 1224401633
-person 1
-person 2
-'''
+#!/usr/bin/env python3
+# Group 14
+# Ryan Leigh - 1224401633
+# person 1
+# person 2
 
 import sys
 import argparse
