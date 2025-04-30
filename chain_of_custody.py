@@ -12,6 +12,7 @@ import os
 import argparse
 import time
 import uuid
+import struct
 from datetime import datetime, timezone
 from Crypto.Cipher import AES
 from enum import Enum
@@ -147,15 +148,19 @@ class BlockChain:
         return g
 
     def init_chain(self):
+        # explicit `bchoc init`
         if not os.path.exists(self.filename) or os.path.getsize(self.filename) == 0:
-            genesis = self._create_genesis_block()
-            self._write_block(genesis)
+            self._write_block(self._create_genesis_block())
             print("Created INITIAL block.")
             sys.exit(0)
 
-        with open(self.filename, 'rb') as f:
-            hdr = f.read(Block.HEADER_SIZE)
-        prev_hash, _, _, _, state_b, *rest = unpack(Block.HEADER_FMT, hdr)
+        try:
+            with open(self.filename, 'rb') as f:
+                hdr = f.read(Block.HEADER_SIZE)
+            prev_hash, _, _, _, state_b, *rest = unpack(Block.HEADER_FMT, hdr)
+        except (struct.error, ValueError):
+            print("Blockchain file found but corrupted.")
+            sys.exit(1)
 
         if prev_hash != b"\0"*32 or state_b != State.INITIAL.value:
             print("Blockchain file found but corrupted.")
@@ -185,12 +190,7 @@ class BlockChain:
             f.write(block.serialize())
 
     def add(self, args):
-        if not os.path.exists(self.filename) or os.path.getsize(self.filename) == 0:
-            genesis = self._create_genesis_block()
-            self._write_block(genesis)
-            print("Created INITIAL block.")
-            sys.exit(0)
-        self.load_chain()
+        # assume ensure_genesis() + load_chain() already ran in main()
         if args.p != ROLE_PASSWORDS['CREATOR']:
             print("Invalid password")
             sys.exit(1)
@@ -205,24 +205,32 @@ class BlockChain:
         except ValueError:
             print("Invalid case ID format")
             sys.exit(1)
+
         for item_str in args.i:
             for blk in self.blocks[1:]:
                 raw = decrypt_bytes(blk.evidence_item_id)
-                existing_id = unpack("<I", raw[:4])[0]
-                if existing_id == int(item_str):
+                if unpack("<I", raw[:4])[0] == int(item_str):
                     print("Duplicate item ID")
                     sys.exit(1)
-            prev_hash = self.blocks[-1].compute_hash()
-            item_enc = encrypt_bytes(pack("<I", int(item_str)))
-            item_field = item_enc.ljust(32, b"\0")
-            case_enc = encrypt_bytes(case_uuid.bytes)
-            case_field = case_enc.ljust(32, b"\0")
-            creator_field = args.g.encode('utf-8').ljust(12, b"\0")
-            new_blk = Block(prev_hash, case_field, item_field, State.CHECKEDIN, creator_field, Owner.NULL, 0, b"")
+
+            prev_hash    = self.blocks[-1].compute_hash()
+            item_enc     = encrypt_bytes(pack("<I", int(item_str)))
+            case_enc     = encrypt_bytes(case_uuid.bytes)
+            creator_f    = args.g.encode('utf-8').ljust(12, b'\0')
+            new_blk = Block(
+                prev_hash,
+                case_enc.ljust(32, b'\0'),
+                item_enc.ljust(32, b'\0'),
+                State.CHECKEDIN,
+                creator_f,
+                Owner.NULL,
+                0, b""
+            )
             self._write_block(new_blk)
             self.blocks.append(new_blk)
-            ts = datetime.fromtimestamp(new_blk.timestamp, tz=timezone.utc)
-            ts_str = ts.isoformat().replace('+00:00','Z')
+
+            ts_str = datetime.fromtimestamp(new_blk.timestamp, tz=timezone.utc)\
+                         .isoformat().replace('+00:00','Z')
             print(f"Added item: {item_str}")
             print(f"Status: {new_blk.state.name}")
             print(f"Time of action: {ts_str}")
@@ -234,10 +242,10 @@ class BlockChain:
         if not args.i:
             print("Item ID not provided")
             sys.exit(1)
-        if not args.y:
+        if not args.why:
             print("Reason not provided")
             sys.exit(1)
-        reason = args.y.upper()
+        reason = args.why.upper()
         if reason not in ("DISPOSED","DESTROYED","RELEASED"):
             print("Invalid reason")
             sys.exit(1)
@@ -329,30 +337,37 @@ class BlockChain:
 
     def show_cases(self, args):
         if args.p not in ROLE_PASSWORDS.values():
-            print("Invalid password")
-            sys.exit(1)
-        cases = set()
+            print("Invalid password"); sys.exit(1)
+        cases = []
         for blk in self.blocks[1:]:
             cid = uuid.UUID(bytes=decrypt_bytes(blk.case_id))
-            cases.add(cid)
-        for c in sorted(cases):
+            if args.c and str(cid) != args.c:    continue
+            # for `-i` on show cases you might ignore or use it as “only if case has this item”
+            cases.append(cid)
+        for c in sorted(set(cases)):
             print(c)
 
     def show_items(self, args):
         if args.p not in ROLE_PASSWORDS.values():
-            print("Invalid password")
-            sys.exit(1)
-        items = set()
+            print("Invalid password"); sys.exit(1)
+        items = []
         for blk in self.blocks[1:]:
             iid = unpack("<I", decrypt_bytes(blk.evidence_item_id)[:4])[0]
-            items.add(iid)
-        for i in sorted(items):
+            if args.i and str(iid) != args.i:    continue
+            if args.c:
+                cid = uuid.UUID(bytes=decrypt_bytes(blk.case_id))
+                if str(cid) != args.c:            continue
+            items.append(iid)
+        for i in sorted(set(items)):
             print(i)
 
     def show_history(self, args):
         if args.p not in ROLE_PASSWORDS.values():
             print("Invalid password")
             sys.exit(1)
+
+        # collect and filter into entries
+        entries = []
         for blk in self.blocks[1:]:
             cid = uuid.UUID(bytes=decrypt_bytes(blk.case_id))
             iid = unpack("<I", decrypt_bytes(blk.evidence_item_id)[:4])[0]
@@ -360,27 +375,56 @@ class BlockChain:
                 continue
             if args.i and str(iid) != args.i:
                 continue
-            ts = datetime.fromtimestamp(blk.timestamp, tz=timezone.utc).isoformat().replace('+00:00','Z')
-            print(f"{ts} - Case: {cid} Item: {iid} State: {blk.state.name}")
+
+            ts = datetime.fromtimestamp(blk.timestamp, tz=timezone.utc) \
+                        .isoformat().replace('+00:00','Z')
+            entries.append((ts, cid, iid, blk.state.name))
+
+        # respect reverse ordering
+        if getattr(args, 'reverse', False):
+            entries.reverse()
+
+        # print them
+        for ts, cid, iid, state in entries:
+            print(f"{ts} - Case: {cid} Item: {iid} State: {state}")
+
 
     def log(self, args):
         if args.p not in ROLE_PASSWORDS.values():
             print("Invalid password")
             sys.exit(1)
+
+        # ensure genesis & load_chain already ran in main(), but re-load just in case
         self.load_chain()
-        entries=[]
+
+        # collect into entries
+        entries = []
         for blk in self.blocks[1:]:
-            ts=datetime.fromtimestamp(blk.timestamp, tz=timezone.utc)\
-                     .isoformat().replace('+00:00','Z')
-            cid=uuid.UUID(bytes=decrypt_bytes(blk.case_id))
-            iid=unpack("<I",decrypt_bytes(blk.evidence_item_id)[:4])[0]
-            entries.append((ts,cid,iid,blk.state.name))
-        if args.c: entries=[e for e in entries if str(e[1])==args.c]
-        if args.i: entries=[e for e in entries if str(e[2])==args.i]
-        if args.r: entries.reverse()
+            ts  = datetime.fromtimestamp(blk.timestamp, tz=timezone.utc) \
+                         .isoformat().replace('+00:00','Z')
+            cid = uuid.UUID(bytes=decrypt_bytes(blk.case_id))
+            iid = unpack("<I", decrypt_bytes(blk.evidence_item_id)[:4])[0]
+            entries.append((ts, cid, iid, blk.state.name))
+
+        # apply filters
+        if args.c:
+            entries = [e for e in entries if str(e[1]) == args.c]
+        if args.i:
+            entries = [e for e in entries if str(e[2]) == args.i]
+
+        # reverse if requested
+        if getattr(args, 'reverse', False):
+            entries.reverse()
+
+        # apply -n limit
         if args.n is not None:
-            entries = entries[:args.n] if args.r else entries[-args.n:]
-        for ts,cid,iid,state in entries:
+            if getattr(args, 'reverse', False):
+                entries = entries[:args.n]
+            else:
+                entries = entries[-args.n:]
+
+        # print
+        for ts, cid, iid, state in entries:
             print(f"{ts} - Case: {cid} Item: {iid} State: {state}")
 
     def verify(self, args):
@@ -423,20 +467,27 @@ def main():
     sub=parser.add_subparsers(dest='cmd')
 
     sub.add_parser('init')
-    add_p=sub.add_parser('add'); add_p.add_argument('-c',required=False); add_p.add_argument('-i',action='append',required=False);
+    add_p=sub.add_parser('add'); add_p.add_argument('-c',required=False); add_p.add_argument('-i',action='append',required=False)
     add_p.add_argument('-p',required=True); add_p.add_argument('-g',default='CREATOR')
-    remove_p=sub.add_parser('remove') 
-    remove_p.add_argument('-i',required=False)
-    remove_p.add_argument('-y',required=False)
-    remove_p.add_argument('-o',required=False)
-    remove_p.add_argument('-p',required=True)
+    remove_p=sub.add_parser('remove'); remove_p.add_argument('-i',required=False)
+    remove_p.add_argument('-y','--why', required=False, help="Reason: DISPOSED, DESTROYED, or RELEASED"); remove_p.add_argument('-o',required=False); remove_p.add_argument('-p',required=True)
     checkin_p=sub.add_parser('checkin'); checkin_p.add_argument('-i',required=True); checkin_p.add_argument('-p',required=True)
     checkout_p=sub.add_parser('checkout'); checkout_p.add_argument('-i',required=True); checkout_p.add_argument('-p',required=True)
 
     show_p=sub.add_parser('show'); show_sub=show_p.add_subparsers(dest='subcmd')
-    show_cases_p=show_sub.add_parser('cases'); show_cases_p.add_argument('-p',required=True)
-    show_items_p=show_sub.add_parser('items'); show_items_p.add_argument('-p',required=True)
+    
+    show_cases_p = show_sub.add_parser('cases')
+    show_cases_p.add_argument('-p', required=True)
+    show_cases_p.add_argument('-c', required=False)
+    show_cases_p.add_argument('-i', required=False)
+
+    show_items_p = show_sub.add_parser('items')
+    show_items_p.add_argument('-p', required=True)
+    show_items_p.add_argument('-c', required=False)
+    show_items_p.add_argument('-i', required=False)
+
     show_hist=show_sub.add_parser('history'); show_hist.add_argument('-p',required=True); show_hist.add_argument('-c'); show_hist.add_argument('-i')
+    show_hist.add_argument('-r','--reverse', action='store_true', help="reverse order")
 
     verify_p=sub.add_parser('verify'); verify_p.add_argument('-p',required=True)
     summary_p=sub.add_parser('summary'); summary_p.add_argument('-c',required=True); summary_p.add_argument('-p',required=True)
@@ -445,7 +496,10 @@ def main():
     log_p=sub.add_parser('log')
     log_p.add_argument('-p', required=True)
     log_p.add_argument('-n', type=int, default=None)
-    log_p.add_argument('-r', action='store_true')
+    log_p.add_argument('-r', '--reverse',
+                   action='store_true',
+                   dest='reverse',
+                   help="reverse order")
     log_p.add_argument('-c')
     log_p.add_argument('-i')
 
@@ -454,22 +508,22 @@ def main():
 
     if args.cmd == 'init':
         bc.init_chain()
-    elif args.cmd == 'add':
-        bc.add(args)
-    elif args.cmd == 'log':
-        bc.log(args)
-    elif args.cmd == 'show':
-        if args.subcmd == 'cases':
-            bc.show_cases(args)
-        elif args.subcmd == 'items':
-            bc.show_items(args)
-        elif args.subcmd == 'history':
-            bc.show_history(args)
     else:
-        # only for remove/checkout/checkin/verify/summary do we auto-init
         bc.ensure_genesis()
         bc.load_chain()
-        if args.cmd == 'remove':
+
+        if args.cmd == 'add':
+            bc.add(args)
+        elif args.cmd == 'log':
+            bc.log(args)
+        elif args.cmd == 'show':
+            if args.subcmd == 'cases':
+                bc.show_cases(args)
+            elif args.subcmd == 'items':
+                bc.show_items(args)
+            elif args.subcmd == 'history':
+                bc.show_history(args)
+        elif args.cmd == 'remove':
             bc.remove(args)
         elif args.cmd == 'checkout':
             bc.checkout(args)
