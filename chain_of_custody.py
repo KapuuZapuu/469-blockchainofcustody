@@ -85,13 +85,11 @@ class Block:
         self.data              = data_bytes
 
     def serialize(self) -> bytes:
-        # owner_bytes: handle Owner enum, raw bytes, or string
         if isinstance(self.owner, Owner):
             owner_bytes = self.owner.value
         elif isinstance(self.owner, (bytes, bytearray)):
             owner_bytes = self.owner.ljust(12, b'\0')[:12]
         else:
-            # assume it's a str
             owner_bytes = str(self.owner).encode('utf-8').ljust(12, b'\0')[:12]
         header = pack(
             self.HEADER_FMT,
@@ -148,7 +146,6 @@ class BlockChain:
         return g
 
     def init_chain(self):
-        # explicit `bchoc init`
         if not os.path.exists(self.filename) or os.path.getsize(self.filename) == 0:
             self._write_block(self._create_genesis_block())
             print("Created INITIAL block.")
@@ -157,7 +154,7 @@ class BlockChain:
         try:
             with open(self.filename, 'rb') as f:
                 hdr = f.read(Block.HEADER_SIZE)
-            prev_hash, _, _, _, state_b, *rest = unpack(Block.HEADER_FMT, hdr)
+            prev_hash, _, _, _, state_b, *_ = unpack(Block.HEADER_FMT, hdr)
         except (struct.error, ValueError):
             print("Blockchain file found but corrupted.")
             sys.exit(1)
@@ -168,12 +165,6 @@ class BlockChain:
 
         print("Blockchain file found with INITIAL block.")
         sys.exit(0)
-
-    def ensure_genesis(self):
-        if not os.path.exists(self.filename) or os.path.getsize(self.filename) == 0:
-            g = self._create_genesis_block()
-            self._write_block(g)
-            print("Created INITIAL block.")
 
     def load_chain(self):
         self.blocks = []
@@ -190,33 +181,27 @@ class BlockChain:
             f.write(block.serialize())
 
     def add(self, args):
-        # assume ensure_genesis() + load_chain() already ran in main()
         if args.p != ROLE_PASSWORDS['CREATOR']:
-            print("Invalid password")
-            sys.exit(1)
+            print("Invalid password"); sys.exit(1)
         if not args.c:
-            print("Case ID not provided")
-            sys.exit(1)
+            print("Case ID not provided"); sys.exit(1)
         if not args.i:
-            print("Item ID not provided")
-            sys.exit(1)
+            print("Item ID not provided"); sys.exit(1)
         try:
             case_uuid = uuid.UUID(args.c)
         except ValueError:
-            print("Invalid case ID format")
-            sys.exit(1)
+            print("Invalid case ID format"); sys.exit(1)
 
         for item_str in args.i:
             for blk in self.blocks[1:]:
                 raw = decrypt_bytes(blk.evidence_item_id)
                 if unpack("<I", raw[:4])[0] == int(item_str):
-                    print("Duplicate item ID")
-                    sys.exit(1)
+                    print("Duplicate item ID"); sys.exit(1)
 
-            prev_hash    = self.blocks[-1].compute_hash()
-            item_enc     = encrypt_bytes(pack("<I", int(item_str)))
-            case_enc     = encrypt_bytes(case_uuid.bytes)
-            creator_f    = args.g.encode('utf-8').ljust(12, b'\0')
+            prev_hash  = self.blocks[-1].compute_hash()
+            item_enc   = encrypt_bytes(pack("<I", int(item_str)))
+            case_enc   = encrypt_bytes(case_uuid.bytes)
+            creator_f  = args.g.encode('utf-8').ljust(12, b'\0')
             new_blk = Block(
                 prev_hash,
                 case_enc.ljust(32, b'\0'),
@@ -290,8 +275,10 @@ class BlockChain:
             print("Invalid password")
             sys.exit(1)
         last_blk = None
-        for blk in self.blocks[1:]: raw = decrypt_bytes(blk.evidence_item_id)
-        if unpack("<I", raw[:4])[0] == int(args.i): last_blk = blk
+        for blk in self.blocks[1:]:
+            raw = decrypt_bytes(blk.evidence_item_id)
+            if unpack("<I", raw[:4])[0] == int(args.i):
+                last_blk = blk
         if last_blk is None or last_blk.state != State.CHECKEDIN:
             print("Cannot checkout item in current state")
             sys.exit(1)
@@ -341,8 +328,13 @@ class BlockChain:
         cases = []
         for blk in self.blocks[1:]:
             cid = uuid.UUID(bytes=decrypt_bytes(blk.case_id))
-            if args.c and str(cid) != args.c:    continue
-            # for `-i` on show cases you might ignore or use it as “only if case has this item”
+            if args.c and str(cid) != args.c:
+                continue
+            # enforce -i filter: only include if this block’s item matches
+            if args.i:
+                iid = unpack("<I", decrypt_bytes(blk.evidence_item_id)[:4])[0]
+                if str(iid) != args.i:
+                    continue
             cases.append(cid)
         for c in sorted(set(cases)):
             print(c)
@@ -353,20 +345,19 @@ class BlockChain:
         items = []
         for blk in self.blocks[1:]:
             iid = unpack("<I", decrypt_bytes(blk.evidence_item_id)[:4])[0]
-            if args.i and str(iid) != args.i:    continue
+            if args.i and str(iid) != args.i:
+                continue
             if args.c:
                 cid = uuid.UUID(bytes=decrypt_bytes(blk.case_id))
-                if str(cid) != args.c:            continue
+                if str(cid) != args.c:
+                    continue
             items.append(iid)
         for i in sorted(set(items)):
             print(i)
 
     def show_history(self, args):
         if args.p not in ROLE_PASSWORDS.values():
-            print("Invalid password")
-            sys.exit(1)
-
-        # collect and filter into entries
+            print("Invalid password"); sys.exit(1)
         entries = []
         for blk in self.blocks[1:]:
             cid = uuid.UUID(bytes=decrypt_bytes(blk.case_id))
@@ -375,55 +366,34 @@ class BlockChain:
                 continue
             if args.i and str(iid) != args.i:
                 continue
-
-            ts = datetime.fromtimestamp(blk.timestamp, tz=timezone.utc) \
-                        .isoformat().replace('+00:00','Z')
+            ts = datetime.fromtimestamp(blk.timestamp, tz=timezone.utc).isoformat().replace('+00:00','Z')
             entries.append((ts, cid, iid, blk.state.name))
-
-        # respect reverse ordering
-        if getattr(args, 'reverse', False):
+        if args.reverse:
             entries.reverse()
-
-        # print them
         for ts, cid, iid, state in entries:
             print(f"{ts} - Case: {cid} Item: {iid} State: {state}")
 
-
     def log(self, args):
         if args.p not in ROLE_PASSWORDS.values():
-            print("Invalid password")
-            sys.exit(1)
-
-        # ensure genesis & load_chain already ran in main(), but re-load just in case
+            print("Invalid password"); sys.exit(1)
         self.load_chain()
-
-        # collect into entries
         entries = []
         for blk in self.blocks[1:]:
-            ts  = datetime.fromtimestamp(blk.timestamp, tz=timezone.utc) \
-                         .isoformat().replace('+00:00','Z')
+            ts  = datetime.fromtimestamp(blk.timestamp, tz=timezone.utc).isoformat().replace('+00:00','Z')
             cid = uuid.UUID(bytes=decrypt_bytes(blk.case_id))
             iid = unpack("<I", decrypt_bytes(blk.evidence_item_id)[:4])[0]
             entries.append((ts, cid, iid, blk.state.name))
-
-        # apply filters
         if args.c:
             entries = [e for e in entries if str(e[1]) == args.c]
         if args.i:
             entries = [e for e in entries if str(e[2]) == args.i]
-
-        # reverse if requested
-        if getattr(args, 'reverse', False):
+        if args.reverse:
             entries.reverse()
-
-        # apply -n limit
         if args.n is not None:
-            if getattr(args, 'reverse', False):
+            if args.reverse:
                 entries = entries[:args.n]
             else:
                 entries = entries[-args.n:]
-
-        # print
         for ts, cid, iid, state in entries:
             print(f"{ts} - Case: {cid} Item: {iid} State: {state}")
 
@@ -447,28 +417,33 @@ class BlockChain:
             print("Invalid password")
             sys.exit(1)
         case_uuid = uuid.UUID(args.c)
-        counts = {s.name:0 for s in State}
-        items = set()
+        # build map of each item → its last state
+        last_state = {}
         for blk in self.blocks[1:]:
             cid = uuid.UUID(bytes=decrypt_bytes(blk.case_id))
             if cid != case_uuid:
                 continue
             iid = unpack("<I", decrypt_bytes(blk.evidence_item_id)[:4])[0]
-            items.add(iid)
-            counts[blk.state.name] += 1
+            last_state[iid] = blk.state.name
+
         print(f"Case {case_uuid} summary:")
-        print(f"Total unique items: {len(items)}")
-        for s, c in counts.items():
-            print(f"{s}: {c}")
+        print(f"Total unique items: {len(last_state)}")
+        # count how many items are currently in each state
+        for state in State:
+            cnt = sum(1 for st in last_state.values() if st == state.name)
+            print(f"{state.name}: {cnt}")
+
 
 # --- CLI parsing and dispatch ---
 def main():
-    parser=argparse.ArgumentParser(prog='bchoc')
-    sub=parser.add_subparsers(dest='cmd')
-
+    parser = argparse.ArgumentParser(prog='bchoc')
+    sub    = parser.add_subparsers(dest='cmd')
     sub.add_parser('init')
-    add_p=sub.add_parser('add'); add_p.add_argument('-c',required=False); add_p.add_argument('-i',action='append',required=False)
-    add_p.add_argument('-p',required=True); add_p.add_argument('-g',default='CREATOR')
+    add_p = sub.add_parser('add')
+    add_p.add_argument('-c', required=False)
+    add_p.add_argument('-i', action='append', required=False)
+    add_p.add_argument('-p', required=True)
+    add_p.add_argument('-g', default='CREATOR')
     remove_p=sub.add_parser('remove'); remove_p.add_argument('-i',required=False)
     remove_p.add_argument('-y','--why', required=False, help="Reason: DISPOSED, DESTROYED, or RELEASED"); remove_p.add_argument('-o',required=False); remove_p.add_argument('-p',required=True)
     checkin_p=sub.add_parser('checkin'); checkin_p.add_argument('-i',required=True); checkin_p.add_argument('-p',required=True)
@@ -503,18 +478,28 @@ def main():
     log_p.add_argument('-c')
     log_p.add_argument('-i')
 
-    args=parser.parse_args()
-    bc=BlockChain()
+    args = parser.parse_args()
+    bc   = BlockChain()
 
     if args.cmd == 'init':
         bc.init_chain()
-    else:
-        bc.ensure_genesis()
-        bc.load_chain()
 
-        if args.cmd == 'add':
-            bc.add(args)
-        elif args.cmd == 'log':
+    elif args.cmd == 'add':
+        if not os.path.exists(bc.filename) or os.path.getsize(bc.filename) == 0:
+            bc.init_chain()
+        bc.load_chain()
+        bc.add(args)
+
+    else:
+        # for all other commands, we require an existing chain file
+        if not os.path.exists(bc.filename) or os.path.getsize(bc.filename) == 0:
+            # if a password check comes next, they’ll handle it; otherwise we treat
+            # "no chain" as an error in each cmd method
+            bc.blocks = []
+        else:
+            bc.load_chain()
+
+        if args.cmd == 'log':
             bc.log(args)
         elif args.cmd == 'show':
             if args.subcmd == 'cases':
