@@ -45,13 +45,15 @@ def encrypt_item_id(item_id: str | int, key: bytes) -> bytes:
     item_bytes = pack(">I", int_id)
     return encrypt(item_bytes, key)
 
-def decrypt_case_id(enc_case_id: bytes, key: bytes) -> str:
-    raw = decrypt(enc_case_id, key)
-    return str(uuid.UUID(bytes=raw[:16]))
-
 def decrypt_item_id(enc_item_id: bytes, key: bytes) -> int:
-    raw = decrypt(enc_item_id, key)
+    ciphertext = enc_item_id[:AES.block_size]
+    raw = decrypt(ciphertext, key)
     return int.from_bytes(raw[:4], byteorder='big')
+
+def decrypt_case_id(enc_case_id: bytes, key: bytes) -> str:
+    ciphertext = enc_case_id[: 2 * AES.block_size ]
+    raw = decrypt(ciphertext, key)
+    return str(uuid.UUID(bytes=raw[:16]))
 
 class State(Enum):
     INITIAL = b"INITIAL\0\0\0\0\0"
@@ -66,7 +68,7 @@ class Owner(Enum):
     LAWYER = b"Lawyer\0\0\0\0\0\0"
     ANALYST = b"Analyst\0\0\0\0\0"
     EXECUTIVE = b"Executive\0\0\0"
-    NULL = b"NONE\0\0\0\0\0\0\0\0"
+    NULL = b"\0\0\0\0\0\0\0\0\0\0"
 
 class Block():
     def __init__(self,
@@ -112,7 +114,7 @@ class BlockChain():
         # if os.environ.get('BCHOC_FILE_PATH') and os.path.getsize(os.environ.get('BCHOC_FILE_PATH')) == 0:
             # sys.exit(1)
         self.filename = filename
-        #self.init() ## REMOVE LATER
+        # self.init() ## REMOVE LATER
 
     def init(self):
         status = False
@@ -121,11 +123,6 @@ class BlockChain():
             status = self.load_blockchain()
 
         if len(self.blocks) > 0:
-            block, data = self.blocks[0]
-            _, _, _, _, state, _,_,_ = unpack_block(block)
-            if state == State.INITIAL:
-                print("initial found")
-
             return
 
         if status == True and len(self.blocks) <= 0:
@@ -146,12 +143,10 @@ class BlockChain():
             self.blocks = [(block.pack_block(), self.ensure_bytes(block.data))]
             open(self.filename, 'ab').close()
             print("Blockchain file not found. Created INITIAL block.")
-        self.print_blockchain()
+        self.save_blockchain()
+        # self.print_blockchain()
 
     def add_block(self, encrypted_case_id: bytes, encrypted_item_id: bytes, state: State, creator: bytes, owner: Owner, data: bytes):
-        if len(self.blocks) <= 0:
-            self.init()
-
         prev_block_header, _ = self.blocks[-1]
         prev_hash, _, _, _, _, _, _, _ = unpack_block(prev_block_header)
         block = Block(
@@ -166,48 +161,46 @@ class BlockChain():
         )
         self.blocks.append((block.pack_block(), self.ensure_bytes(data)))
 
-    def add(self, case_id : bytes, evidence_item_ids : bytes, creator : str, password : str):
-        self.print_blockchain()
+    def add(self, case_id: str, evidence_item_ids: list[str], creator: str, password: str) -> None:
+        # self.print_blockchain()
+        if len(self.blocks) <= 0:
+            self.init()
         ## check creator password
         if not self.verify_password(creator, password):
-            print(f"Invalid password")
+            print("Invalid password")
             sys.exit(1)
-            return
 
+        print(self.blocks)
         ids = set()
         for i, (block_header, _) in enumerate(self.blocks):
-            _, _, _, encrypted_item_id, _, _, _, _ = unpack_block(block_header)
-            if i != 0:
-                item_id_bytes = decrypt(encrypted_item_id, self.encryption_key)
-                decrypted_item_id = int.from_bytes(item_id_bytes[:4], byteorder="big")
-                ids.add(str(decrypted_item_id))
-            # numeric_regex = re.compile(b'\d')
-            # index = len(decrypted_item_id)
-            # for i, byte in enumerate(decrypted_item_id):
-            #     if not numeric_regex.match(bytes([byte])):
-            #         index = i
-            #         break
-            # valid_part = decrypted_item_id[:index]
-            # string_data = valid_part.decode('utf-8')
-            # ids.add(string_data)
+            if i == 0:
+                continue
+            _, _, _, enc_item_id, *rest = unpack_block(block_header)
+            existing_id = decrypt_item_id(enc_item_id, self.encryption_key)
+            ids.add(existing_id)
 
-        added_items = []
-        for evidence_item_id in evidence_item_ids:
-            if str(evidence_item_id) in ids:
-                print(f"Error: Duplicate item ID {evidence_item_id} — already exists in blockchain.")
-                # sys.exit(1)
+        print(ids)
+        for raw_id in evidence_item_ids:
+            new_id = int(raw_id)
+            if new_id in ids:
+                print(f"Error: Duplicate item ID {new_id} — already exists in blockchain.")
                 return
-            owner = Owner.NULL
-            enc_case_id = encrypt_case_id(case_id, self.encryption_key).ljust(32, b'\0')
-            enc_item_id = encrypt_item_id(evidence_item_id, self.encryption_key).ljust(32, b'\0')
-            self.add_block(enc_case_id, enc_item_id, State.CHECKEDIN, creator.encode(), owner, f"Item {evidence_item_id} added and checked in.")
-            added_items.append(evidence_item_id)
-            time_of_action = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime()) + 'Z'
-            print(f"Added item: {evidence_item_id}")
-            print("Status: CHECKEDIN")
-            print(f"Time of action: {time_of_action}")
 
-        self.print_blockchain()
+            enc_case = encrypt_case_id(case_id, self.encryption_key)
+            enc_item = encrypt_item_id(new_id, self.encryption_key)
+            self.add_block(
+                enc_case,
+                enc_item,
+                State.CHECKEDIN,
+                creator.encode(),
+                Owner.NULL,
+                f"Item {new_id} added and checked in."
+            )
+            print(f"Added item: {new_id}")
+            print("Status: CHECKEDIN")
+            print(f"Time of action: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+
+        # 4) persist
         self.save_blockchain()
 
     def print_blockchain(self):
@@ -223,10 +216,8 @@ class BlockChain():
                 #case_id = decrypt(enc_case_id, self.encryption_key).decode('utf-8').strip('\0')
                 #item_id = decrypt(enc_item_id, self.encryption_key).decode('utf-8').strip('\0')
                 if i != 0:
-                    case_id_bytes = decrypt(enc_case_id, self.encryption_key)
-                    case_id = str(uuid.UUID(bytes=case_id_bytes[:16]))
-                    item_id_bytes = decrypt(enc_item_id, self.encryption_key)
-                    item_id = int.from_bytes(item_id_bytes[:4], byteorder="big")
+                    case_id = decrypt_case_id(enc_case_id, self.encryption_key)
+                    item_id = decrypt_item_id(enc_item_id, self.encryption_key)
                 else:
                     case_id = enc_case_id
                     item_id = enc_item_id
