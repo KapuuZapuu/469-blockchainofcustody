@@ -72,8 +72,8 @@ class Owner(Enum):
 
 class Block():
     def __init__(self,
-        previous_hash : bytes, case_id : bytes,
-        evidence_item_id : bytes, state : State,
+        previous_hash : bytes, case_id : uuid,
+        evidence_item_id : int, state : State,
         creator : bytes, owner : Owner, # needs to be Police, Lawyer, Analyst, Executive
         data_len : int, data : bytes
         ):
@@ -118,18 +118,30 @@ class BlockChain():
 
     def init(self):
         status = False
-        if os.path.exists(self.filename):
+        if not os.path.exists(self.filename) or os.path.getsize(self.filename) == 0:
+            block = self.create_genesis()
+            self.blocks = [(block.pack_block(), self.ensure_bytes(block.data))]
+            open(self.filename, 'ab').close()
+            print("Blockchain file not found. Created INITIAL block.")
+            self.save_blockchain()
+            return
+        else:
             print("Blockchain file found. Loading Data")
             status = self.load_blockchain()
 
-        if len(self.blocks) > 0:
-            return
+        with open(self.filename, 'rb') as f:
+            header = f.read(144)
+            prev_hash, _, _, _, state_bytes, *_ = unpack("32s d 32s 32s 12s 12s 12s I",header)
 
-        if status == True and len(self.blocks) <= 0:
-            status = False
-        
-        if not status:
-            block = Block(
+        if state_bytes != State.INITIAL.value:
+            block = self.create_genesis()
+            self.blocks = [(block.pack_block(), self.ensure_bytes(block.data))]
+            print("Blockchain file found but Created INITIAL block.")
+        self.save_blockchain()
+        # self.print_blockchain()
+
+    def create_genesis(self):
+        block = Block(
                 previous_hash=b"\0" * 32,
                 case_id=b"\0" * 32,
                 evidence_item_id=b"\0" * 32,
@@ -139,12 +151,7 @@ class BlockChain():
                 data_len=0,
                 data=b"Initial block\0"
             )
-            # print(Owner.NULL.)
-            self.blocks = [(block.pack_block(), self.ensure_bytes(block.data))]
-            open(self.filename, 'ab').close()
-            print("Blockchain file not found. Created INITIAL block.")
-        self.save_blockchain()
-        # self.print_blockchain()
+        return block
 
     def add_block(self, encrypted_case_id: bytes, encrypted_item_id: bytes, state: State, creator: bytes, owner: Owner, data: bytes):
         prev_block_header, _ = self.blocks[-1]
@@ -162,21 +169,22 @@ class BlockChain():
         self.blocks.append((block.pack_block(), self.ensure_bytes(data)))
 
     def add(self, case_id: str, evidence_item_ids: list[str], creator: str, password: str) -> None:
-        # self.print_blockchain()
+        # print(evidence_item_ids)
         if len(self.blocks) <= 0:
             self.init()
+        # self.print_blockchain()
         ## check creator password
         if not self.verify_password(creator, password):
             print("Invalid password")
             sys.exit(1)
 
-        # print(self.blocks)
         ids = set()
         for i, (block_header, _) in enumerate(self.blocks):
             if i == 0:
                 continue
             _, _, _, enc_item_id, *rest = unpack_block(block_header)
-            existing_id = decrypt_item_id(enc_item_id, self.encryption_key)
+            # existing_id = decrypt_item_id(enc_item_id, self.encryption_key)
+            existing_id = int.from_bytes(enc_item_id[:4], 'big')
             ids.add(existing_id)
 
         # print(ids)
@@ -186,11 +194,15 @@ class BlockChain():
                 print(f"Error: Duplicate item ID {new_id} — already exists in blockchain.")
                 sys.exit(1)
 
-            enc_case = encrypt_case_id(case_id, self.encryption_key)
-            enc_item = encrypt_item_id(new_id, self.encryption_key)
+            # enc_case = encrypt_case_id(case_id, self.encryption_key)
+            # enc_item = encrypt_item_id(raw_id, self.encryption_key)
+            raw_case_id = uuid.UUID(case_id).bytes.ljust(32, b'\0')      # 16 bytes padded to 32
+            raw_item_id = pack(">I", new_id).ljust(32, b'\0')             # 4 bytes padded to 32
+
+            prev_hash = self.blocks[-1][0][:32]
             self.add_block(
-                enc_case,
-                enc_item,
+                raw_case_id,
+                raw_item_id,
                 State.CHECKEDIN,
                 creator.encode(),
                 Owner.NULL,
@@ -200,7 +212,6 @@ class BlockChain():
             print("Status: CHECKEDIN")
             print(f"Time of action: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
 
-        # 4) persist
         self.save_blockchain()
 
     def print_blockchain(self):
@@ -249,6 +260,9 @@ class BlockChain():
         if password == os.environ.get(env_var_name, ''):
             return True
         return True
+
+    def verify(self):
+        sys.exit(0)
 
 
     def save_blockchain(self):
@@ -303,7 +317,7 @@ def parse_input(blockchain : BlockChain):
     # Add Subparser
     parser_add = subparsers.add_parser('add')
     parser_add.add_argument('-c', '--case_id', required=True)
-    parser_add.add_argument('-i', '--item_id', nargs='+', required=True)
+    parser_add.add_argument('-i', '--item_id', action='append', required=True)
     parser_add.add_argument('-g', '--creator', required=True)
     parser_add.add_argument('-p', '--password', required=True)
     # Checkout Subparser
