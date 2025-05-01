@@ -57,8 +57,8 @@ def decrypt_case_id(enc_case_id: bytes, key: bytes) -> str:
 
 class State(Enum):
     INITIAL = b"INITIAL\0\0\0\0\0"
-    CHECKEDIN = b"CHECKEDIN\0\0"
-    CHECKEDOUT = b"CHECKEDOUT\0"
+    CHECKEDIN = b"CHECKEDIN\0\0\0"
+    CHECKEDOUT = b"CHECKEDOUT\0\0"
     DISPOSED = b"DISPOSED\0\0\0\0"
     DESTROYED = b"DESTROYED\0\0\0"
     RELEASED = b"RELEASED\0\0\0\0"
@@ -103,7 +103,7 @@ class Block():
 ## NOT IN BLOCK CLASS, THIS IS INTENTIONAL, SOLUTION SUCKS BUT IT IS WHAT IT IS
 def unpack_block(block):
     prev_hash, timestamp, case_id, evidence_item_id, state, creator, owner, data_len = unpack("32s d 32s 32s 12s 12s 12s I", block)
-    return prev_hash, timestamp, case_id, evidence_item_id, state.strip(b'\x00').decode(), creator.strip(b'\x00').decode(), owner.strip(b'\x00').decode(), data_len
+    return prev_hash, timestamp, case_id, evidence_item_id, state, creator, owner, data_len
 
 class BlockChain():
     def __init__(self, encryption_key):
@@ -148,7 +148,7 @@ class BlockChain():
                 state=State.INITIAL,
                 creator=b"\0" * 12,
                 owner=Owner.NULL,
-                data_len=0,
+                data_len=14,
                 data=b"Initial block\0"
             )
         return block
@@ -213,6 +213,7 @@ class BlockChain():
             print(f"Time of action: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
 
         self.save_blockchain()
+        # self.print_blockchain()
 
     def print_blockchain(self):
         if not self.blocks:
@@ -226,12 +227,12 @@ class BlockChain():
                 prev_hash, timestamp, enc_case_id, enc_item_id, state, creator, owner, data_len = unpack_block(header)
                 #case_id = decrypt(enc_case_id, self.encryption_key).decode('utf-8').strip('\0')
                 #item_id = decrypt(enc_item_id, self.encryption_key).decode('utf-8').strip('\0')
-                if i != 0:
-                    case_id = decrypt_case_id(enc_case_id, self.encryption_key)
-                    item_id = decrypt_item_id(enc_item_id, self.encryption_key)
-                else:
-                    case_id = enc_case_id
-                    item_id = enc_item_id
+                # if i != 0:
+                #     case_id = decrypt_case_id(enc_case_id, self.encryption_key)
+                #     item_id = decrypt_item_id(enc_item_id, self.encryption_key)
+                # else:
+                case_id = enc_case_id
+                item_id = enc_item_id
 
                 data_str = data.decode('utf-8', errors='ignore').strip('\0')
 
