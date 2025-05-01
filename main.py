@@ -170,7 +170,7 @@ class BlockChain():
             print("Invalid password")
             sys.exit(1)
 
-        print(self.blocks)
+        # print(self.blocks)
         ids = set()
         for i, (block_header, _) in enumerate(self.blocks):
             if i == 0:
@@ -179,12 +179,12 @@ class BlockChain():
             existing_id = decrypt_item_id(enc_item_id, self.encryption_key)
             ids.add(existing_id)
 
-        print(ids)
+        # print(ids)
         for raw_id in evidence_item_ids:
             new_id = int(raw_id)
             if new_id in ids:
                 print(f"Error: Duplicate item ID {new_id} — already exists in blockchain.")
-                return
+                sys.exit(1)
 
             enc_case = encrypt_case_id(case_id, self.encryption_key)
             enc_item = encrypt_item_id(new_id, self.encryption_key)
