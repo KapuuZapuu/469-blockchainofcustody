@@ -1,7 +1,7 @@
 all: install bchoc
 
 install:
-	python3 -m pip install -r requirements.txt
+	python3 -m pip install pycryptodome
 
 bchoc: chain_of_custody.py
 	cp chain_of_custody.py bchoc
