@@ -38,22 +38,39 @@ def decrypt(ciphertext: bytes, key: bytes) -> bytes:
 
 def encrypt_case_id(case_id_str: str, key: bytes) -> bytes:
     case_uuid = uuid.UUID(case_id_str)
-    return encrypt(case_uuid.bytes, key)
+    raw_bytes = case_uuid.bytes
+    assert isinstance(raw_bytes, bytes) and len(raw_bytes) == 16, "Case ID must be 16 bytes"
+    ciphertext = encrypt(raw_bytes, key)
+    assert len(ciphertext) == 32, "Encrypted case ID should be 32 bytes (padded)"
+    return ciphertext
 
 def encrypt_item_id(item_id: str | int, key: bytes) -> bytes:
     int_id = int(item_id)
-    item_bytes = pack(">I", int_id)
-    return encrypt(item_bytes, key)
+    item_bytes = pack(">I", int_id)  # 4 bytes
+    assert isinstance(item_bytes, bytes) and len(item_bytes) == 4, "Item ID must be 4 bytes"
+    ciphertext = encrypt(item_bytes, key)
+    assert len(ciphertext) == 16, "Encrypted item ID should be 16 bytes (padded)"
+    return ciphertext
 
 def decrypt_item_id(enc_item_id: bytes, key: bytes) -> int:
-    ciphertext = enc_item_id[:AES.block_size]
-    raw = decrypt(ciphertext, key)
+    assert isinstance(enc_item_id, bytes), "Encrypted item ID must be bytes"
+    assert len(enc_item_id) >= 16, "Encrypted item ID must be at least 16 bytes"
+    raw = decrypt(enc_item_id[:AES.block_size], key)
+    assert len(raw) >= 4, "Decrypted data must be at least 4 bytes"
     return int.from_bytes(raw[:4], byteorder='big')
 
 def decrypt_case_id(enc_case_id: bytes, key: bytes) -> str:
-    ciphertext = enc_case_id[: 2 * AES.block_size ]
-    raw = decrypt(ciphertext, key)
+    assert isinstance(enc_case_id, bytes), "Encrypted case ID must be bytes"
+    assert len(enc_case_id) >= 32, "Encrypted case ID must be at least 32 bytes"
+    raw = decrypt(enc_case_id[:2 * AES.block_size], key)
+    assert len(raw) >= 16, "Decrypted case ID must be at least 16 bytes"
     return str(uuid.UUID(bytes=raw[:16]))
+
+def to_case_id_bytes(case_id_str: str) -> bytes:
+    return uuid.UUID(case_id_str).bytes.ljust(32, b'\0')  # 16-byte UUID padded to 32
+
+def to_item_id_bytes(item_id: str | int) -> bytes:
+    return pack(">I", int(item_id)).ljust(32, b'\0')  # 4-byte int padded to 32
 
 class State(Enum):
     INITIAL = b"INITIAL\0\0\0\0\0"
@@ -68,7 +85,7 @@ class Owner(Enum):
     LAWYER = b"Lawyer\0\0\0\0\0\0"
     ANALYST = b"Analyst\0\0\0\0\0"
     EXECUTIVE = b"Executive\0\0\0"
-    NULL = b"\0\0\0\0\0\0\0\0\0\0"
+    NULL = b"\0" * 12
 
 class Block():
     def __init__(self,
@@ -121,7 +138,7 @@ class BlockChain():
         if not os.path.exists(self.filename) or os.path.getsize(self.filename) == 0:
             block = self.create_genesis()
             self.blocks = [(block.pack_block(), self.ensure_bytes(block.data))]
-            open(self.filename, 'ab').close()
+            # open(self.filename, 'ab').close()
             print("Blockchain file not found. Created INITIAL block.")
             self.save_blockchain()
             return
@@ -138,19 +155,19 @@ class BlockChain():
             self.blocks = [(block.pack_block(), self.ensure_bytes(block.data))]
             print("Blockchain file found but Created INITIAL block.")
         self.save_blockchain()
-        # self.print_blockchain()
 
     def create_genesis(self):
         block = Block(
                 previous_hash=b"\0" * 32,
-                case_id=b"\0" * 32,
-                evidence_item_id=b"\0" * 32,
+                case_id=b"0" * 32,
+                evidence_item_id=b"0" * 32,
                 state=State.INITIAL,
                 creator=b"\0" * 12,
                 owner=Owner.NULL,
                 data_len=14,
                 data=b"Initial block\0"
             )
+        block.timestamp = 0
         return block
 
     def add_block(self, encrypted_case_id: bytes, encrypted_item_id: bytes, state: State, creator: bytes, owner: Owner, data: bytes):
@@ -174,7 +191,7 @@ class BlockChain():
             self.init()
         # self.print_blockchain()
         ## check creator password
-        if not self.verify_password(creator, password):
+        if not password == 'C67C':
             print("Invalid password")
             sys.exit(1)
 
@@ -194,15 +211,17 @@ class BlockChain():
                 print(f"Error: Duplicate item ID {new_id} — already exists in blockchain.")
                 sys.exit(1)
 
+            print(case_id)
             # enc_case = encrypt_case_id(case_id, self.encryption_key)
-            # enc_item = encrypt_item_id(raw_id, self.encryption_key)
-            raw_case_id = uuid.UUID(case_id).bytes.ljust(32, b'\0')      # 16 bytes padded to 32
-            raw_item_id = pack(">I", new_id).ljust(32, b'\0')             # 4 bytes padded to 32
+            # enc_item = encrypt_item_id(new_id, self.encryption_key)
+            enc_case = uuid.UUID(case_id).bytes.ljust(32, b'\0')      # 16 bytes padded to 32
+            print(enc_case)
+            enc_item = pack(">I", new_id).ljust(32, b'\0')             # 4 bytes padded to 32
 
             prev_hash = self.blocks[-1][0][:32]
             self.add_block(
-                raw_case_id,
-                raw_item_id,
+                enc_case,
+                enc_item,
                 State.CHECKEDIN,
                 creator.encode(),
                 Owner.NULL,
@@ -214,6 +233,114 @@ class BlockChain():
 
         self.save_blockchain()
         # self.print_blockchain()
+
+    def checkout(self, item_id: str, password: str):
+        # if not self.verify_password("dummy", password):  # replace with proper role logic if needed
+        #     print("Invalid password")
+        #     sys.exit(1)
+        if len(self.blocks) <= 0:
+            self.init()
+        # enc_item_id = int.from_bytes(item[:4], byteorder='big')
+        enc_item_id = pack(">I", int(item_id)).ljust(32, b'\0')
+        enc_item_id = int(item_id.strip())
+        # print("spain", enc_item_id)
+        found = False
+        # print(self.blocks)
+        for header, _ in reversed(self.blocks):
+            _, timestamp, enc_case_id, block_item_id, state, creator, owner, data_len = unpack_block(header)
+            # print("spain", block_item_id)
+            block_item_id = int.from_bytes(block_item_id[:4], byteorder='big')
+            # print(block_item_id)
+            # block_item_id = decrypt_item_id(block_item_id, self.encryption_key)
+            print(block_item_id, enc_item_id)
+            if block_item_id == enc_item_id:
+                # print("success")
+                if state == State.RELEASED.value or state == State.DESTROYED.value or state == State.DISPOSED.value:
+                    print("Item has been removed and cannot be checked out.")
+                    sys.exit(1)
+
+                # print(enc_case_id)
+                # case_id = decrypt_case_id(enc_case_id, self.encryption_key)
+                case_id = enc_case_id
+                case_id = uuid.UUID(bytes=case_id[:16]).bytes.ljust(32, b'\0') 
+                item_id = pack(">I", enc_item_id).ljust(32, b'\0')
+                prev_hash = self.blocks[-1][0][:32]
+                data = f"Checked out item: {item_id}"
+                new_block = Block(
+                    previous_hash=prev_hash,
+                    case_id=case_id,
+                    evidence_item_id=item_id,
+                    state=State.CHECKEDOUT,
+                    creator=b"\0\0\0\0\0\0\0\0\0\0\0\0",
+                    owner=Owner.NULL,
+                    data_len=len(data),
+                    data=data.encode()
+                )
+                self.blocks.append((new_block.pack_block(), data.encode()))
+                self.save_blockchain()
+
+                print(f"> Case: {case_id}")
+                print(f"> Checked out item: {item_id}")
+                print("> Status: CHECKEDOUT")
+                print(f"> Time of action: {datetime.utcnow().isoformat()}Z")
+                found = True
+                break
+
+        if not found:
+            print(f"Item ID {item_id} not found in blockchain.")
+            sys.exit(1)
+        # self.print_blockchain()
+
+    def checkin(self, item_id: str, password: str):
+        if len(self.blocks) <= 0:
+            self.init()
+
+        # Convert item_id to int for comparison
+        item_id_int = int(item_id.strip())
+        found = False
+
+        for header, _ in reversed(self.blocks):
+            _, timestamp, enc_case_id, block_item_id, state, creator, owner, data_len = unpack_block(header)
+
+            # Extract int from block's encrypted item ID
+            block_item_id_int = int.from_bytes(block_item_id[:4], byteorder='big')
+
+            if block_item_id_int == item_id_int:
+                if state in [State.RELEASED.value, State.DESTROYED.value, State.DISPOSED.value]:
+                    print("Item has been removed and cannot be checked in.")
+                    sys.exit(1)
+
+                # Use the same case ID as stored, format to UUID for display
+                case_id = uuid.UUID(bytes=enc_case_id[:16])
+                case_id_bytes = to_case_id_bytes(str(case_id))
+                item_id_bytes = to_item_id_bytes(item_id)
+
+                prev_hash = self.blocks[-1][0][:32]
+                data = f"Checked in item: {item_id}"
+                new_block = Block(
+                    previous_hash=prev_hash,
+                    case_id=case_id_bytes,
+                    evidence_item_id=item_id_bytes,
+                    state=State.CHECKEDIN,
+                    creator=b"System\0\0\0\0\0\0",
+                    owner=Owner.NULL,
+                    data_len=len(data),
+                    data=data.encode()
+                )
+                self.blocks.append((new_block.pack_block(), data.encode()))
+                self.save_blockchain()
+
+                print(f"> Case: {case_id}")
+                print(f"> Checked in item: {item_id}")
+                print("> Status: CHECKEDIN")
+                print(f"> Time of action: {datetime.utcnow().isoformat()}Z")
+                found = True
+                break
+
+        if not found:
+            print(f"Item ID {item_id} not found in blockchain.")
+            sys.exit(1)
+
 
     def print_blockchain(self):
         if not self.blocks:
@@ -249,6 +376,50 @@ class BlockChain():
             except Exception as e:
                 print(f"Error reading block {i}: {e}")
 
+    def show_history(self, case_id=None, item_id=None, num_entries=None, reverse=False, password=None):
+        # if not self.verify_password(, password):  # Use a real role if needed
+        #     sys.exit(1)
+        entries = []
+        for i, (header, data) in enumerate(self.blocks):
+            if i == 0:
+                continue  # skip genesis
+
+            prev_hash, timestamp, enc_case_id, enc_item_id, state, creator, owner, data_len = unpack_block(header)
+
+            match_case = match_item = True
+            if case_id:
+                match_case = uuid.UUID(case_id).bytes.ljust(32, b'\0') == enc_case_id
+            if item_id:
+                match_item = pack(">I", int(item_id)).ljust(32, b'\0') == enc_item_id
+
+            if match_case and match_item:
+                try:
+                    decrypted_case_id = decrypt_case_id(enc_case_id, self.encryption_key)
+                    decrypted_item_id = decrypt_item_id(enc_item_id, self.encryption_key)
+                except Exception:
+                    decrypted_case_id = enc_case_id.hex()
+                    decrypted_item_id = enc_item_id.hex()
+
+                entries.append({
+                    "timestamp": timestamp,
+                    "case_id": decrypted_case_id,
+                    "item_id": decrypted_item_id,
+                    "state": state.strip(b'\0').decode(),
+                })
+
+        entries = sorted(entries, key=lambda x: x["timestamp"], reverse=reverse)
+
+      
+        if num_entries:
+            entries = entries[:int(num_entries)]
+
+        for entry in entries:
+            ts = datetime.utcfromtimestamp(entry["timestamp"]).isoformat() + "Z"
+            print(f"> Case: {entry['case_id']}")
+            print(f"> Item: {entry['item_id']}")
+            print(f"> Action: {entry['state']}")
+            print(f"> Time: {ts}\n")
+
     def verify_password(self, creator, password):
         # roles = [Owner.POLICE.strip("\0"), Owner.LAWYER.strip("\0"), Owner.ANALYST.strip("\0"), Owner.EXECUTIVE.strip("\0"), Owner.CREATOR.strip("\0")]
         # for role in roles:
@@ -263,7 +434,7 @@ class BlockChain():
         return True
 
     def verify(self):
-        sys.exit(0)
+        sys.exit(1)
 
 
     def save_blockchain(self):
