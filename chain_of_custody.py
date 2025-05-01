@@ -4,22 +4,18 @@ import sys
 import argparse
 import struct
 import uuid
+import hashlib
 from datetime import datetime, timezone
+from collections import Counter
 from Crypto.Cipher import AES
 
-# exactly the key the grader uses:
 AES_KEY = b"R0chLi4uLi4uLi4="
 CIPHER = AES.new(AES_KEY, AES.MODE_ECB)
 
-# Default path for the blockchain file
 DEFAULT_CHAIN_PATH = "blockchain_data.bin"
-
-# Block header format: prev_hash(32), timestamp(8), case_id(32), item_id(32),
-#                     state(12), actor(12), owner(12), data_len(4)
 GENESIS_FMT = '<32sd32s32s12s12s12sI'
 GENESIS_DATA = b'Initial block\x00'
 
-# Role passwords
 ROLE_PASSWORDS = {
     'CREATOR':   os.environ.get('BCHOC_PASSWORD_CREATOR', ''),
     'POLICE':    os.environ.get('BCHOC_PASSWORD_POLICE', ''),
@@ -28,49 +24,53 @@ ROLE_PASSWORDS = {
     'LAWYER':    os.environ.get('BCHOC_PASSWORD_LAWYER', ''),
 }
 
+def get_prev_hash(path):
+    data = open(path,'rb').read()
+    size = struct.calcsize(GENESIS_FMT)
+    offset = 0
+    last = None
+    while offset + size <= len(data):
+        hdr = data[offset:offset+size]
+        dlen = struct.unpack(GENESIS_FMT, hdr)[-1]
+        last = data[offset:offset+size+dlen]
+        offset += size + dlen
+    return hashlib.sha256(last).digest() if last else b'\x00'*32
+
 def create_genesis(path):
-    header = struct.pack(
+    hdr = struct.pack(
         GENESIS_FMT,
         b'\x00'*32,
         0.0,
         b'0'*32,
         b'0'*32,
-        b'INITIAL'+b'\x00'*5,
+        b'INITIAL'.ljust(12,b'\x00'),
         b'\x00'*12,
         b'\x00'*12,
         len(GENESIS_DATA)
     )
-    with open(path, 'wb') as f:
-        f.write(header + GENESIS_DATA)
+    with open(path,'wb') as f:
+        f.write(hdr + GENESIS_DATA)
 
 def is_valid_genesis(path):
     try:
         size = struct.calcsize(GENESIS_FMT)
-        with open(path,'rb') as f:
-            raw = f.read(size)
-        if len(raw) != size:
-            return False
-        prev, ts, case_id, item_id, state, actor, owner, dlen = \
-            struct.unpack(GENESIS_FMT, raw)
-        return prev == b'\x00'*32 and state.rstrip(b'\x00') == b'INITIAL'
+        raw = open(path,'rb').read(size)
+        if len(raw)!=size: return False
+        prev, ts, c, i, st, a, o, dlen = struct.unpack(GENESIS_FMT,raw)
+        return prev==b'\x00'*32 and st.rstrip(b'\x00')==b'INITIAL'
     except:
         return False
 
-def scan_chain_for_items(data: bytes):
-    items = {}
-    offset, H = 0, struct.calcsize(GENESIS_FMT)
-    while offset + H <= len(data):
-        prev, ts, case_b, item_b, st_b, a, o, dlen = \
-            struct.unpack(GENESIS_FMT, data[offset:offset+H])
-        items[item_b] = st_b.rstrip(b'\x00').decode()
-        offset += H + dlen
-    return items
+def get_role_by_password(pw):
+    for r,p in ROLE_PASSWORDS.items():
+        if pw==p: return r
+    return None
 
 def cmd_init(args):
-    if len(sys.argv) != 2:
-        print('usage: bchoc init', file=sys.stderr)
+    if len(sys.argv)!=2:
+        print('usage: bchoc init',file=sys.stderr)
         sys.exit(1)
-    path = os.environ.get('BCHOC_FILE_PATH', DEFAULT_CHAIN_PATH)
+    path = os.environ.get('BCHOC_FILE_PATH',DEFAULT_CHAIN_PATH)
     if not os.path.exists(path):
         create_genesis(path)
         print('Blockchain file not found. Created INITIAL block.')
@@ -78,54 +78,58 @@ def cmd_init(args):
     if is_valid_genesis(path):
         print('Blockchain file found with INITIAL block.')
         sys.exit(0)
-    print('Error: invalid blockchain file', file=sys.stderr)
+    print('Error: invalid blockchain file',file=sys.stderr)
     sys.exit(1)
 
 def cmd_add(args):
-    path = os.environ.get('BCHOC_FILE_PATH', DEFAULT_CHAIN_PATH)
+    path = os.environ.get('BCHOC_FILE_PATH',DEFAULT_CHAIN_PATH)
     if not os.path.exists(path):
         create_genesis(path)
         print('Blockchain file not found. Created INITIAL block.')
         sys.exit(0)
     if not is_valid_genesis(path):
-        print('Error: invalid blockchain file', file=sys.stderr)
+        print('Error: invalid blockchain file',file=sys.stderr)
         sys.exit(1)
-    if args.password != ROLE_PASSWORDS['CREATOR']:
-        print('Error: invalid password', file=sys.stderr)
+    if args.password!=ROLE_PASSWORDS['CREATOR']:
+        print('Error: invalid password',file=sys.stderr)
         sys.exit(1)
 
-    with open(path,'rb') as f:
-        existing = scan_chain_for_items(f.read())
-
-    now = datetime.now(timezone.utc)
-    now_ts = now.timestamp()
-    iso = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    prev_hash = b'\x00'*32
+    # gather existing
+    data = open(path,'rb').read()
+    H = struct.calcsize(GENESIS_FMT)
+    existing = {}
+    off = 0
+    while off+H<=len(data):
+        _,_,_,item_b,st,_,_,dlen = struct.unpack(GENESIS_FMT,data[off:off+H])
+        existing[item_b]=st.rstrip(b'\x00').decode()
+        off += H+dlen
 
     for it in args.item:
         iid = int(it)
-        raw16 = struct.pack('>I', iid).rjust(16, b'\x00')
+        raw16 = struct.pack('>I',iid).rjust(16,b'\x00')
         key = CIPHER.encrypt(raw16).hex().encode()
         if key in existing and existing[key] != 'REMOVED':
-            print(f"Error: duplicate item {iid}", file=sys.stderr)
+            print(f"Error: duplicate item {iid}",file=sys.stderr)
             sys.exit(1)
 
-        case_raw = uuid.UUID(args.case).bytes
-        case_field = CIPHER.encrypt(case_raw).hex().encode()
-        item_field = CIPHER.encrypt(raw16).hex().encode()
+        prev = get_prev_hash(path)
+        now = datetime.now(timezone.utc)
+        ts = now.timestamp()
+        iso = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        case_field = CIPHER.encrypt(uuid.UUID(args.case).bytes).hex().encode()
+        item_field = key
 
         hdr = struct.pack(
             GENESIS_FMT,
-            prev_hash,
-            now_ts,
-            case_field,
-            item_field,
-            b"CHECKEDIN".ljust(12, b"\x00"),
-            args.guid.encode().ljust(12, b"\x00"),
-            b"\x00"*12,
+            prev, ts,
+            case_field, item_field,
+            b"CHECKEDIN".ljust(12,b'\x00'),
+            args.guid.encode().ljust(12,b'\x00'),
+            b'\x00'*12,
             0
         )
-        with open(path,"ab") as f:
+        with open(path,'ab') as f:
             f.write(hdr)
         print(f"Added item: {iid}")
         print("Status: CHECKEDIN")
@@ -133,234 +137,450 @@ def cmd_add(args):
 
     sys.exit(0)
 
-def get_role_by_password(pw: str):
-    """Return role name if pw matches one of ROLE_PASSWORDS, else None."""
-    for role, pwd in ROLE_PASSWORDS.items():
-        if pw == pwd:
-            return role
-    return None
-
 def cmd_checkout(args):
-    path = os.environ.get('BCHOC_FILE_PATH', DEFAULT_CHAIN_PATH)
+    path = os.environ.get('BCHOC_FILE_PATH',DEFAULT_CHAIN_PATH)
     role = get_role_by_password(args.password)
     if role is None:
-        print('Error: invalid password', file=sys.stderr)
+        print('Error: invalid password',file=sys.stderr)
         sys.exit(1)
 
-    data = open(path, 'rb').read()
-    size = struct.calcsize(GENESIS_FMT)
-    iid = int(args.item)
-    raw16 = struct.pack('>I', iid).rjust(16, b'\x00')
+    data = open(path,'rb').read()
+    H = struct.calcsize(GENESIS_FMT)
+    raw16 = struct.pack('>I',int(args.item)).rjust(16,b'\x00')
     item_field = CIPHER.encrypt(raw16).hex().encode()
 
-    offset = 0
-    last_state = None
-    case_field = None
-    actor_bytes = None
-    while offset + size <= len(data):
-        prev, ts, case_b, item_b, st_b, a_b, o_b, dlen = \
-            struct.unpack(GENESIS_FMT, data[offset:offset+size])
-        if item_b == item_field:
-            last_state  = st_b.rstrip(b'\x00').decode()
-            case_field  = case_b
-            actor_bytes = a_b
-        offset += size + dlen
+    off=0
+    last_state=None
+    case_field=None
+    actor_bytes=None
+    while off+H<=len(data):
+        _,_,c,i,st,a,o,dlen = struct.unpack(GENESIS_FMT,data[off:off+H])
+        if i==item_field:
+            last_state=st.rstrip(b'\x00').decode()
+            case_field=c
+            actor_bytes=a
+            last_owner=o
+        off+=H+dlen
 
     if last_state is None:
-        print(f"Error: item {iid} not found", file=sys.stderr)
+        print(f"Error: item {args.item} not found",file=sys.stderr)
         sys.exit(1)
-    if last_state != 'CHECKEDIN':
-        print(f"Error: cannot checkout item {iid} (current: {last_state})", file=sys.stderr)
+    if last_state!='CHECKEDIN':
+        print(f"Error: cannot checkout item {args.item} (current: {last_state})",file=sys.stderr)
         sys.exit(1)
 
+    prev = get_prev_hash(path)
     now = datetime.now(timezone.utc)
-    ts  = now.timestamp()
+    ts = now.timestamp()
     iso = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     hdr = struct.pack(
         GENESIS_FMT,
-        b'\x00'*32,
-        ts,
-        case_field,
-        item_field,
-        b"CHECKEDOUT".ljust(12, b"\x00"),
+        prev, ts,
+        case_field, item_field,
+        b"CHECKEDOUT".ljust(12,b'\x00'),
         actor_bytes,
-        role.encode().ljust(12, b"\x00"),
+        role.encode().ljust(12,b'\x00'),
         0
     )
-    with open(path, "ab") as f:
+    with open(path,'ab') as f:
         f.write(hdr)
 
-    print(f"Checked out item: {iid}")
+    print(f"Checked out item: {args.item}")
     print("Status: CHECKEDOUT")
     print(f"Time of action: {iso}")
     sys.exit(0)
 
 def cmd_checkin(args):
-    path = os.environ.get('BCHOC_FILE_PATH', DEFAULT_CHAIN_PATH)
+    path = os.environ.get('BCHOC_FILE_PATH',DEFAULT_CHAIN_PATH)
     role = get_role_by_password(args.password)
     if role is None:
-        print('Error: invalid password', file=sys.stderr)
+        print('Error: invalid password',file=sys.stderr)
         sys.exit(1)
 
-    data = open(path, 'rb').read()
-    size = struct.calcsize(GENESIS_FMT)
-    iid = int(args.item)
-    raw16 = struct.pack('>I', iid).rjust(16, b'\x00')
+    data = open(path,'rb').read()
+    H = struct.calcsize(GENESIS_FMT)
+    raw16 = struct.pack('>I',int(args.item)).rjust(16,b'\x00')
     item_field = CIPHER.encrypt(raw16).hex().encode()
 
-    offset = 0
-    last_state = None
-    case_field = None
-    actor_bytes = None
-    while offset + size <= len(data):
-        prev, ts, case_b, item_b, st_b, a_b, o_b, dlen = \
-            struct.unpack(GENESIS_FMT, data[offset:offset+size])
-        if item_b == item_field:
-            last_state  = st_b.rstrip(b'\x00').decode()
-            case_field  = case_b
-            actor_bytes = a_b
-        offset += size + dlen
+    off=0
+    last_state=None
+    case_field=None
+    actor_bytes=None
+    last_owner=None
+    while off+H<=len(data):
+        _,_,c,i,st,a,o,dlen = struct.unpack(GENESIS_FMT,data[off:off+H])
+        if i==item_field:
+            last_state=st.rstrip(b'\x00').decode()
+            case_field=c
+            actor_bytes=a
+            last_owner=o
+        off+=H+dlen
 
     if last_state is None:
-        print(f"Error: item {iid} not found", file=sys.stderr)
+        print(f"Error: item {args.item} not found",file=sys.stderr)
         sys.exit(1)
-    if last_state != 'CHECKEDOUT':
-        print(f"Error: cannot checkin item {iid} (current: {last_state})", file=sys.stderr)
+    if last_state!='CHECKEDOUT':
+        print(f"Error: cannot checkin item {args.item} (current: {last_state})",file=sys.stderr)
         sys.exit(1)
 
+    prev = get_prev_hash(path)
     now = datetime.now(timezone.utc)
-    ts  = now.timestamp()
+    ts = now.timestamp()
     iso = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     hdr = struct.pack(
         GENESIS_FMT,
-        b'\x00'*32,
-        ts,
-        case_field,
-        item_field,
-        b"CHECKEDIN".ljust(12, b"\x00"),
+        prev, ts,
+        case_field, item_field,
+        b"CHECKEDIN".ljust(12,b'\x00'),
         actor_bytes,
-        b'\x00'*12,
+        last_owner,        # preserve the last owner
         0
     )
-    with open(path, "ab") as f:
+    with open(path,'ab') as f:
         f.write(hdr)
 
-    print(f"Checked in item: {iid}")
+    print(f"Checked in item: {args.item}")
     print("Status: CHECKEDIN")
     print(f"Time of action: {iso}")
     sys.exit(0)
 
 def cmd_remove(args):
-    path = os.environ.get('BCHOC_FILE_PATH', DEFAULT_CHAIN_PATH)
-    if args.password != ROLE_PASSWORDS['CREATOR']:
-        print('Error: invalid password', file=sys.stderr)
+    path = os.environ.get('BCHOC_FILE_PATH',DEFAULT_CHAIN_PATH)
+    role = get_role_by_password(args.password)
+    if role is None:
+        print('Error: invalid password',file=sys.stderr)
         sys.exit(1)
 
-    data = open(path, 'rb').read()
-    size = struct.calcsize(GENESIS_FMT)
-    iid = int(args.item)
-    raw16 = struct.pack('>I', iid).rjust(16, b'\x00')
+    data = open(path,'rb').read()
+    H = struct.calcsize(GENESIS_FMT)
+    raw16 = struct.pack('>I',int(args.item)).rjust(16,b'\x00')
     item_field = CIPHER.encrypt(raw16).hex().encode()
 
-    offset = 0
-    last_state = None
-    case_field = None
-    actor_bytes = None
-    while offset + size <= len(data):
-        prev, ts, case_b, item_b, st_b, a_b, o_b, dlen = \
-            struct.unpack(GENESIS_FMT, data[offset:offset+size])
-        if item_b == item_field:
-            last_state  = st_b.rstrip(b'\x00').decode()
-            case_field  = case_b
-            actor_bytes = a_b
-        offset += size + dlen
+    off=0
+    last_state=None
+    case_field=None
+    actor_bytes=None
+    last_owner=None
+    while off+H<=len(data):
+        _,_,c,i,st,a,o,dlen = struct.unpack(GENESIS_FMT,data[off:off+H])
+        if i==item_field:
+            last_state=st.rstrip(b'\x00').decode()
+            case_field=c
+            actor_bytes=a
+            last_owner=o
+        off+=H+dlen
 
     if last_state is None:
-        print(f"Error: item {iid} not found", file=sys.stderr)
+        print(f"Error: item {args.item} not found",file=sys.stderr)
         sys.exit(1)
-    if last_state != 'CHECKEDIN':
-        print(f"Error: cannot remove item {iid} (current: {last_state})", file=sys.stderr)
+    if last_state!='CHECKEDIN':
+        print(f"Error: cannot remove item {args.item} (current: {last_state})",file=sys.stderr)
         sys.exit(1)
 
     reason = args.why.upper()
-    if reason not in ('DISPOSED', 'DESTROYED', 'RELEASED'):
-        print('Error: invalid reason', file=sys.stderr)
+    if reason not in ('DISPOSED','DESTROYED','RELEASED'):
+        print('Error: invalid reason',file=sys.stderr)
         sys.exit(1)
 
-    owner_field = b'\x00'*12
-    if reason == 'RELEASED':
-        if not args.owner:
-            print('Error: owner required for RELEASED', file=sys.stderr)
-            sys.exit(1)
-        owner_field = args.owner.encode().ljust(12, b'\x00')
+    # for RELEASED we now auto-set to remover’s role
+    if reason=='RELEASED':
+        owner_field = role.encode().ljust(12,b'\x00')
+    else:
+        owner_field = last_owner
 
+    prev = get_prev_hash(path)
     now = datetime.now(timezone.utc)
-    ts  = now.timestamp()
+    ts = now.timestamp()
     iso = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     hdr = struct.pack(
         GENESIS_FMT,
-        b'\x00'*32,
-        ts,
-        case_field,
-        item_field,
-        reason.encode().ljust(12, b"\x00"),
+        prev, ts,
+        case_field, item_field,
+        reason.encode().ljust(12,b'\x00'),
         actor_bytes,
         owner_field,
         0
     )
-    with open(path, "ab") as f:
+    with open(path,'ab') as f:
         f.write(hdr)
 
-    print(f"Removed item: {iid}")
+    print(f"Removed item: {args.item}")
     print(f"Status: {reason}")
-    if reason == 'RELEASED':
-        print(f"Released to: {args.owner}")
+    if reason=='RELEASED':
+        print(f"Released to role: {role}")
     print(f"Time of action: {iso}")
     sys.exit(0)
 
-def main():
-    parser = argparse.ArgumentParser(prog='bchoc')
-    sub = parser.add_subparsers(dest='command')
+def decode_case(c_b):
+    if c_b==b'\x00'*32:
+        return b'00000000-0000-0000-0000-000000000000'
+    try:
+        raw = CIPHER.decrypt(bytes.fromhex(c_b.decode()))
+        return str(uuid.UUID(bytes=raw)).encode()
+    except:
+        return c_b
 
-    sub.add_parser('init', help='initialize the blockchain')
+def decode_item(i_b):
+    if i_b==b'\x00'*32:
+        return b'0'
+    try:
+        raw = CIPHER.decrypt(bytes.fromhex(i_b.decode()))
+        iid = struct.unpack('>I',raw[-4:])[0]
+        return str(iid).encode()
+    except:
+        return i_b
 
-    p_add = sub.add_parser('add', help='add items')
-    p_add.add_argument('-c','--case',     required=True, help='case UUID')
-    p_add.add_argument('-i','--item',     required=True, action='append', help='item ID')
-    p_add.add_argument('-g','--guid',     required=True, help='creator GUID')
-    p_add.add_argument('-p','--password', required=True, help='creator password')
-
-    p_co = sub.add_parser('checkout', help='checkout item')
-    p_co.add_argument('-i','--item',     required=True, help='item ID')
-    p_co.add_argument('-p','--password', required=True, help='role password')
-
-    p_ci = sub.add_parser('checkin', help='checkin item')
-    p_ci.add_argument('-i','--item',     required=True, help='item ID')
-    p_ci.add_argument('-p','--password', required=True, help='role password')
-
-    p_rm = sub.add_parser('remove', help='remove item')
-    p_rm.add_argument('-i','--item',     required=True, help='item ID')
-    p_rm.add_argument('-y','--why',      required=True, help='reason: DISPOSED, DESTROYED or RELEASED')
-    p_rm.add_argument('-o','--owner',    help='owner to release to (required if --why=RELEASED)')
-    p_rm.add_argument('-p','--password', required=True, help='creator password')
-
-    args = parser.parse_args()
-    if args.command == 'init':
-        cmd_init(args)
-    elif args.command == 'add':
-        cmd_add(args)
-    elif args.command == 'checkout':
-        cmd_checkout(args)
-    elif args.command == 'checkin':
-        cmd_checkin(args)
-    elif args.command == 'remove':
-        cmd_remove(args)
-    else:
-        parser.print_usage(sys.stderr)
+def cmd_show(args):
+    path = os.environ.get('BCHOC_FILE_PATH',DEFAULT_CHAIN_PATH)
+    if not os.path.exists(path) or not is_valid_genesis(path):
+        print('Error: invalid blockchain file',file=sys.stderr)
         sys.exit(1)
 
-if __name__ == '__main__':
+    data = open(path,'rb').read()
+    H = struct.calcsize(GENESIS_FMT)
+
+    if args.what=='cases':
+        cases=set()
+        off=0
+        while off+H<=len(data):
+            _,_,c,_,_,_,_,dlen = struct.unpack(GENESIS_FMT,data[off:off+H])
+            if c!=b'0'*32:
+                try:
+                    raw = CIPHER.decrypt(bytes.fromhex(c.decode()))
+                    cases.add(str(uuid.UUID(bytes=raw)))
+                except:
+                    pass
+            off+=H+dlen
+        for c in sorted(cases):
+            print(c)
+        sys.exit(0)
+
+    if args.what=='items':
+        if not args.case:
+            print('Error: case required',file=sys.stderr)
+            sys.exit(1)
+        target = CIPHER.encrypt(uuid.UUID(args.case).bytes).hex().encode()
+        items=set()
+        off=0
+        while off+H<=len(data):
+            _,_,c,ib,_,_,_,dlen = struct.unpack(GENESIS_FMT,data[off:off+H])
+            if c==target:
+                try:
+                    raw = CIPHER.decrypt(bytes.fromhex(ib.decode()))
+                    items.add(struct.unpack('>I',raw[-4:])[0])
+                except:
+                    pass
+            off+=H+dlen
+        for i in sorted(items):
+            print(i)
+        sys.exit(0)
+
+    if args.what=='history':
+        # per-item history
+        if args.case and args.item and args.password:
+            if get_role_by_password(args.password) is None:
+                print('Error: invalid password',file=sys.stderr)
+                sys.exit(1)
+            target_c = CIPHER.encrypt(uuid.UUID(args.case).bytes).hex().encode()
+            raw16     = struct.pack('>I',int(args.item)).rjust(16,b'\x00')
+            target_i  = CIPHER.encrypt(raw16).hex().encode()
+            entries=[]
+            off=0
+            while off+H<=len(data):
+                _,ts,c,ib,st,a,o,dlen = struct.unpack(GENESIS_FMT,data[off:off+H])
+                if c==target_c and ib==target_i:
+                    iso = datetime.fromtimestamp(ts,timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                    entries.append((ts,iso,st.rstrip(b'\x00').decode(),a.rstrip(b'\x00').decode(),o.rstrip(b'\x00').decode()))
+                off+=H+dlen
+
+            # default chronological
+            entries.sort(key=lambda x:x[0])
+            if args.reverse:
+                entries.reverse()
+            if args.number:
+                entries = entries[:args.number]
+
+            for _,iso,st,ac,ow in entries:
+                print(f"Time: {iso} | State: {st} | Actor: {ac} | Owner: {ow}")
+            sys.exit(0)
+
+        # global history
+        if args.password and get_role_by_password(args.password):
+            blocks=[]
+            off=0
+            while off+H<=len(data):
+                prev,ts,c,i,st,a,o,dlen = struct.unpack(GENESIS_FMT,data[off:off+H])
+                blocks.append({
+                    'case_id':    decode_case(c),
+                    'evidence_id':decode_item(i),
+                    'state':      st.rstrip(b'\x00'),
+                    'timestamp':  ts
+                })
+                off+=H+dlen
+            # chronological
+            blocks.sort(key=lambda x:x['timestamp'])
+            if args.reverse:
+                blocks.reverse()
+            if args.number:
+                blocks = blocks[:args.number]
+            print(repr(blocks))
+            sys.exit(0)
+
+        print('Error: case, item, and password required',file=sys.stderr)
+        sys.exit(1)
+
+    print('Error: unknown show command',file=sys.stderr)
+    sys.exit(1)
+
+def cmd_summary(args):
+    if not args.case:
+        print('Error: case required',file=sys.stderr)
+        sys.exit(1)
+    path = os.environ.get('BCHOC_FILE_PATH',DEFAULT_CHAIN_PATH)
+    if not os.path.exists(path) or not is_valid_genesis(path):
+        print('Error: invalid blockchain file',file=sys.stderr)
+        sys.exit(1)
+
+    data = open(path,'rb').read()
+    H = struct.calcsize(GENESIS_FMT)
+    target = CIPHER.encrypt(uuid.UUID(args.case).bytes).hex().encode()
+
+    counts = Counter()
+    items = set()
+    off=0
+    while off+H<=len(data):
+        _,_,c,i,st,a,o,dlen = struct.unpack(GENESIS_FMT,data[off:off+H])
+        if c==target:
+            state = st.rstrip(b'\x00').decode()
+            counts[state]+=1
+            # track unique evidence
+            try:
+                raw = CIPHER.decrypt(bytes.fromhex(i.decode()))
+                iid = struct.unpack('>I',raw[-4:])[0]
+            except:
+                iid = 0
+            items.add(iid)
+        off+=H+dlen
+
+    total = len(items)
+    print(f"Case Summary for Case ID: {args.case}")
+    print(f"Total Evidence Items: {total}")
+    print(f"Checked In: {counts.get('CHECKEDIN',0)}")
+    print(f"Checked Out: {counts.get('CHECKEDOUT',0)}")
+    print(f"Disposed: {counts.get('DISPOSED',0)}")
+    print(f"Destroyed: {counts.get('DESTROYED',0)}")
+    print(f"Released: {counts.get('RELEASED',0)}")
+    sys.exit(0)
+
+def cmd_verify(args):
+    path = os.environ.get('BCHOC_FILE_PATH',DEFAULT_CHAIN_PATH)
+    if not os.path.exists(path) or not is_valid_genesis(path):
+        print('Error: invalid genesis block',file=sys.stderr)
+        sys.exit(1)
+
+    data = open(path,'rb').read()
+    H = struct.calcsize(GENESIS_FMT)
+    blocks=[]
+    off=0
+    while off+H<=len(data):
+        hdr = data[off:off+H]
+        prev,ts,c,i,st,a,o,dlen = struct.unpack(GENESIS_FMT,hdr)
+        raw_data = data[off+H:off+H+dlen]
+        blocks.append((hdr+raw_data,{
+            'prev':prev,'ts':ts,
+            'state':st.rstrip(b'\x00').decode(),'item':i
+        }))
+        off+=H+dlen
+
+    # genesis
+    if blocks[0][1]['prev']!=b'\x00'*32 or blocks[0][1]['state']!='INITIAL':
+        print('Error: invalid genesis block',file=sys.stderr)
+        sys.exit(1)
+
+    last_ts = blocks[0][1]['ts']
+    last_states={}
+    for idx in range(1,len(blocks)):
+        raw,meta = blocks[idx]
+        prev_raw,_ = blocks[idx-1]
+        expected = hashlib.sha256(prev_raw).digest()
+        if meta['prev']!=expected:
+            print(f"Error: bad prev_hash at block {idx}",file=sys.stderr)
+            sys.exit(1)
+        if meta['ts']<last_ts:
+            print(f"Error: timestamp rollback at block {idx}",file=sys.stderr)
+            sys.exit(1)
+        last_ts = meta['ts']
+        item = meta['item']
+        curr = meta['state']
+        prev_state = last_states.get(item)
+        allowed = {
+            (None,'CHECKEDIN'),
+            ('CHECKEDIN','CHECKEDOUT'),
+            ('CHECKEDOUT','CHECKEDIN'),
+            ('CHECKEDIN','DISPOSED'),
+            ('CHECKEDIN','DESTROYED'),
+            ('CHECKEDIN','RELEASED'),
+        }
+        if (prev_state,curr) not in allowed:
+            print(f"Error: illegal transition {prev_state}->{curr} at block {idx}",file=sys.stderr)
+            sys.exit(1)
+        last_states[item]=curr
+
+    sys.exit(0)
+
+def main():
+    p = argparse.ArgumentParser(prog='bchoc')
+    sub = p.add_subparsers(dest='command')
+
+    sub.add_parser('init')
+
+    a = sub.add_parser('add')
+    a.add_argument('-c','--case',    required=True)
+    a.add_argument('-i','--item',    required=True,action='append')
+    a.add_argument('-g','--guid',    required=True)
+    a.add_argument('-p','--password',required=True)
+
+    co = sub.add_parser('checkout')
+    co.add_argument('-i','--item',    required=True)
+    co.add_argument('-p','--password',required=True)
+
+    ci = sub.add_parser('checkin')
+    ci.add_argument('-i','--item',    required=True)
+    ci.add_argument('-p','--password',required=True)
+
+    rm = sub.add_parser('remove')
+    rm.add_argument('-i','--item',    required=True)
+    rm.add_argument('-y','--why',     required=True)
+    rm.add_argument('-o','--owner')   # now ignored for RELEASED
+    rm.add_argument('-p','--password',required=True)
+
+    sh = sub.add_parser('show')
+    sh.add_argument('what',choices=['cases','items','history'])
+    sh.add_argument('-c','--case')
+    sh.add_argument('-i','--item')
+    sh.add_argument('-n','--number',type=int)
+    sh.add_argument('-p','--password')
+    sh.add_argument('--reverse',action='store_true')
+
+    su = sub.add_parser('summary')
+    su.add_argument('-c','--case',required=True)
+
+    sub.add_parser('verify')
+
+    args = p.parse_args()
+    cmds = {
+      'init':cmd_init,'add':cmd_add,'checkout':cmd_checkout,
+      'checkin':cmd_checkin,'remove':cmd_remove,
+      'show':cmd_show,'summary':cmd_summary,'verify':cmd_verify
+    }
+    if args.command in cmds:
+        cmds[args.command](args)
+    else:
+        p.print_usage(sys.stderr)
+        sys.exit(1)
+
+if __name__=='__main__':
     main()
